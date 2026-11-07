@@ -8,6 +8,10 @@ Paths starting `packages/` are relative to the metro repo root; `src/` means `pa
 
 It is a fork/descendant of `jest-haste-map`, which is why "haste" appears throughout; Haste is one plugin over a general file map.
 
+### Deliberate `fs` reads above the file map
+
+These sit outside every invalidation mechanism, deliberately; add to them only with a reason as good. **Content reads:** `PackageCache` reads each `package.json` once per path (invalidated from change events); the transform worker reads the file it transforms (reusing the content `getOrComputeSha1` returns when it had to read it); `getSource` re-reads a module's source for source maps; the server streams source and asset files; error and symbolication code frames (including `UnableToResolveError`'s, error path only) read source files; and an asset lists and hashes its scale variants with `readdir` — outside the cache key too (`references/caching.md`, known gaps). **Tree questions:** `IncrementalBundler` checks entry files with `fs.realpath`, `Transformer` asserts each watch folder is a directory, and `lib/metroRuntime.js` / `lib/metroBabelRuntime.js` locate Metro's runtime packages with `require.resolve`, memoized for the process.
+
 ## Lifecycle — `src/index.js`
 
 `FileMap.build()`:
@@ -19,11 +23,11 @@ It is a fork/descendant of `jest-haste-map`, which is why "haste" appears throug
 5. **Validate plugins** (`assertValid()` — e.g. Haste conflicts) *before* persisting.
 6. **Snapshot and persist**, then **watch** if `watch`.
 
-**Changes during the build are not lost.** Non-Watchman backends (Native and Fallback — which also serve a custom crawler, or a Watchman crawl that fell back to the node crawler) have no clock to subscribe `since`, so `Watcher.crawl()` starts them before crawling and buffers their events; `Watcher.watch(onChange, clocks)` replays the buffer as live events after the snapshot is persisted. A backend whose static `isLiveOnStart()` is `false` isn't trusted when `startWatching` resolves — `NativeWatcher`, because "fs.watch can return before any changes are reported" while libuv starts the FSEvents stream on another thread. Once every root's backend has started ("starting one may restart the others' watches (NativeWatchers share one FSEvents stream)"), `#waitUntilLive` writes a health-check cookie into each root, whether or not `healthCheck.enabled`, and waits for the backend to report it — retrying every `LIVE_CHECK_TIMEOUT` (200ms) for up to `MAX_LIVE_WAIT_TIME` (10s) — before the crawl starts. An unconfirmed root only warns ("Changes made during startup may be missed."). This is a cold-path cost of at least one FSEvents round trip on macOS without Watchman. Watchman backends start after the persist but subscribe `since` each watch root's crawl clock (`WatcherOptions.clocks`) — the initial subscription only; a reconnect takes a fresh clock. Either way the persisted snapshot may lag disk briefly, and the first `ChangeEvent` catches it up.
+**Changes during the build are not lost.** Non-Watchman backends (Native and Fallback — which also serve a custom crawler, or a Watchman crawl that fell back to the node crawler) have no clock to subscribe `since`, so `Watcher.crawl()` starts them before crawling and buffers their events; `Watcher.watch(onChange, clocks)` replays the buffer as live events after the snapshot is persisted. A backend that isn't live as soon as it starts (`isLiveOnStart()` is `false`: `NativeWatcher`, whose FSEvents stream starts on another thread) is first confirmed with a health-check cookie written into each root; an unconfirmed root only warns. Watchman backends start after the persist but subscribe `since` each watch root's crawl clock (`WatcherOptions.clocks`) — the initial subscription only; a reconnect takes a fresh clock. Either way the persisted snapshot may lag disk briefly, and the first `ChangeEvent` catches it up.
 
 In watch mode, `#watch` processes each backend event in arrival order on `#changeQueue` (in-band, one file — the queue is shared with `addRoot` crawls) and *enqueues* it; every `CHANGE_INTERVAL` (30ms) it applies the queue to `TreeFS` **in order** and emits one `ChangeEvent` `{changes, logger, rootDir}` — added/modified/removed files and added/removed directories. A `'recrawl'` flushes the queue, re-crawls that directory via `Watcher.recrawl(subpath, fileSystem)` (never Watchman) and applies it via `#applyFileDelta`.
 
-`CACHE_BREAKER` (currently `'14'`) is a module-level constant in `src/index.js`, and the only release-to-release component of the file-map cache key — Metro's version is not in it. **Bump it in the same commit as any change to the shape or content of cached data for the same file-system state** — storing symlink targets pre-resolved (#1687), leaving plugin slots unfilled until a worker runs (#1950), and resolving a relative symlink target on the symlink's own drive (#2161, which changes the stored target of a link on another Windows drive) are all changes of that kind, as is changing which files a plugin's slot is filled for.
+`CACHE_BREAKER` (currently `'14'`) is a module-level constant in `src/index.js`, and the only release-to-release component of the file-map cache key — Metro's version is not in it. **Bump it in the same commit as any change to the shape or content of cached data for the same file-system state**, including changing which files a plugin's slot is filled for (examples in `references/caching.md`, "Cache breakers and versions").
 
 **Net change.** `lib/FileSystemChangeAggregator.js` (a `FileSystemListener`) folds a batch into its net effect: remove-then-add is a modification, add-then-remove is nothing, and a removed file keeps its pre-batch metadata. The tree holds only non-empty directories, so directory events are **synthesized by `TreeFS`**; backend events with `type === 'd'` are dropped.
 
@@ -38,7 +42,7 @@ In watch mode, `#watch` processes each backend event in arrival order on `#chang
 - Otherwise it starts a backend for the root (`Watcher.watchRoot`, watch mode only, confirmed live first where the backend isn't live on start) *before* crawling, then — serialized on `#changeQueue` after flushing pending events — recrawls it with `Watcher.recrawl` (node or custom crawler, never Watchman), applies the result with `#applyFileDelta` and emits one `'change'` if anything changed. `end()` during the crawl rejects rather than applying it.
 - Added roots are **not persisted and not in the cache key**: their files reach the snapshot only through a later write (auto-save, so in Metro only in watch mode), are dropped on the next read (step 4), and are re-crawled by that session's own `addRoot`. There is no root removal.
 
-Who calls it on main: SKILL.md's seams table.
+Who calls it on main: SKILL.md's "Unused and gated mechanisms".
 
 ## `TreeFS` — `src/lib/TreeFS.js`
 
@@ -71,15 +75,15 @@ A tree of `Map`s. Read the OVERVIEW comment at the top of the file; it is the sp
 `lookup` and `hierarchicalLookup`, and plugins' `getOrComputeFileData` (below), take one optional trailing `observations?: ?Observations`: two canonical-path sets, keyed like `ChangeEvent.changes`, split by the events that invalidate them.
 
 - `existence` — invalidated by an added or removed file or directory. `lookup` records the path found, or the **topmost** missing path, so an absent `node_modules` is one entry, not one per package lookup beneath it. `hierarchicalLookup` records **every candidate probed, hit or miss**.
-- `content` — also invalidated by modification. Traversal records each **symlink traversed** (retargeting a link is a modification: "whose content is their target"); `getOrComputeFileData` records the regular file whose plugin data it returns, since that data derives from the file's bytes. The contract also covers directories whose entries were enumerated (`matchFiles` takes no observations; see SKILL.md's seams table).
+- `content` — also invalidated by modification. Traversal records each **symlink traversed** (retargeting a link is a modification: "whose content is their target"); `getOrComputeFileData` records the regular file whose plugin data it returns, since that data derives from the file's bytes. The contract also covers directories whose entries were enumerated (`matchFiles` takes no observations; see SKILL.md's "Unused and gated mechanisms").
 
 Why this shape:
 
-- A parameter, not a return value, so a caller accumulates across one resolution's many lookups; omitted, nothing is allocated. Failed lookups dominate resolution, so even a `Set` or a path conversion per lookup is a measurable cost (a few percent of resolution time, measured in #1944).
+- A parameter, not a return value, so a caller accumulates across one resolution's many lookups; omitted, nothing is allocated. Failed lookups dominate resolution, so even a `Set` or a path conversion per lookup is a measurable cost (a few percent of resolution time).
 - Two sets because events invalidate them differently: an edit can't change whether a path exists, but it can retarget a symlink. With one flat set a consumer must either treat every probe as edit-sensitive (over-invalidation) or miss a retarget (a stale resolution).
 - Canonical paths are what change events carry, so matching is a set lookup.
 
-Status (who passes one, what consumes it) is in SKILL.md's seams table. It is the intended foundation for fine-grained resolution invalidation; build on it rather than inventing a parallel mechanism.
+Status (who passes one, what consumes it) is in SKILL.md's "Unused and gated mechanisms". It is the intended foundation for fine-grained resolution invalidation; build on it rather than inventing a parallel mechanism.
 
 ### `getOrComputeSha1` and `getDifference`
 
