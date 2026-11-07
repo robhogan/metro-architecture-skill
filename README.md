@@ -6,13 +6,13 @@ It is written as the starting point for designing, reviewing or debugging change
 
 ## Install
 
-Copy or symlink `metro-architecture/` into your agent's skills directory, e.g. for Claude Code:
+The repository root is the skill. Clone it into your agent's skills directory, e.g. for Claude Code:
 
 ```sh
-cp -R metro-architecture ~/.claude/skills/
+git clone https://github.com/robhogan/metro-architecture-skill.git ~/.claude/skills/metro-architecture
 ```
 
 ## Layout
 
-- `metro-architecture/SKILL.md` — the pipeline, the seams table, nine principles, a design checklist and anti-patterns.
-- `metro-architecture/references/` — deep dives on the file map, resolution, caching, the incremental graph, and serialization.
+- `SKILL.md` — the pipeline, the seams table, nine principles, a design checklist and anti-patterns.
+- `references/` — deep dives on the file map, resolution, caching, the incremental graph, and serialization.
