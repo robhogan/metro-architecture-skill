@@ -68,36 +68,11 @@ Two rules follow from the diagram alone:
 
 ## The nine principles
 
-### 1. The file system is a data structure, not a syscall
+The first four are about correctness and the last five about performance, and that is their order of priority: speed that costs correctness is worthless, and most of what reaches users as a Metro bug is a delta or an invalidation that was wrong.
 
-`TreeFS` (`metro-file-map/src/lib/TreeFS.js`) is an in-memory tree of `Map`s keyed on path segments, rooted at the project root, with `'..'` entries for anything outside it. Every existence check, type check, `realpath`, glob and package-scope walk in the resolution path is a walk over that tree, so **those questions cost zero syscalls.** The bounded exception in resolution is `package.json` *contents*, which `PackageCache` reads once per path and invalidates from change events.
+### Correctness
 
-That single fact is what buys Metro:
-
-- speed (`#lookupByNormalPath` is a few `Map.get` calls plus string slicing — "this code is extremely hot during resolution, being the most expensive part of a file existence check. Benchmark any modifications!"),
-- determinism (two identical graphs resolve identically regardless of disk timing),
-- testability (fixtures are literal object trees),
-- and, crucially, **invalidation for free** — the only way file state changes is a change event, so there is exactly one place to hook.
-
-The corollary: resolution can only see the file map. A path outside its roots is `{exists: false}` however real it is on disk.
-
-**Design rule:** If you need to know something about a file, add a method to the `FileSystem` interface (`metro-file-map/src/flow-types.js`) or a `FileMapPlugin`. Never reach for `node:fs` above the file-map layer. The existing exceptions (the worker reading the file it transforms, `getSource`, the server streaming files, code frames, asset scale variants, and a few startup checks) are deliberate, sit outside every invalidation mechanism, and are listed in `references/file-map.md`. Add to them only with a reason as good.
-
-`hierarchicalLookup` is the model to copy: instead of exposing raw primitives and making callers loop, it pushes the whole "walk up until you find `package.json`, stopping at `node_modules`" pattern into one traversal that collects the ancestor nodes and the real path on the way, then checks each candidate from the node it already holds. **Push the loop into TreeFS; don't pull nodes out of it — and once you hold a node, don't re-walk from the root.**
-
-### 2. Optimize the warm path; amortize the cold one
-
-Cold start is dominated by crawl + cache deserialization. Warm rebuild is dominated by nothing at all if you do it right — the work should be proportional to the change.
-
-Concretely, cold-start costs are paid *once* and are allowed to be expensive if they make the warm path cheap: running plugin workers over every file, building the Haste map, resolving each symlink's target when its node is populated rather than on every traversal. The converse also holds — don't pay per file for what most files never need: by default a file's sha1 is computed lazily, the first time it is transformed (`watcher.unstable_lazySha1`, default `true`), not for every crawled file. Warm-path costs are paid thousands of times and must be near-zero: a resolution cache hit, a transform cache hit keyed on content, a graph delta touching three modules.
-
-Not everything warm is incremental: every `.bundle` and `.map` request re-serializes the whole graph, and only HMR is proportional to the delta (`references/serialization.md` §4). Per-module work in a serializer is paid per module, per reload.
-
-**Design rule:** When you add work, state which path it's on. Work on the warm path needs a justification and a measurement. If you find yourself adding something per-file to the warm path, you almost certainly want it precomputed on the cold path and stored in the file map, or cached with the transform output.
-
-`RootPathUtils` exists purely because of this: `path.relative` and `path.resolve` were hot enough to matter, so Metro has specialized versions (~8x and ~20x faster respectively) that exploit the "many paths, few roots" assumption. That's the right kind of optimization — a narrower contract in exchange for a constant factor on a hot path, documented and measured where it lives.
-
-### 3. Deltas all the way down
+#### 1. Deltas all the way down
 
 - Crawlers return `{changedFiles, removedFiles}` against a previous state, not a full listing. Watchman clocks make this a server-side query; otherwise `FileSystem.getDifference()` derives it from a listing by mtime (or sha1, where the crawler supplies one).
 - `FileMap` folds each watch batch into its **net** effect (`FileSystemChangeAggregator`: remove-then-add is a modification, add-then-remove is nothing) and emits one `ChangeEvent` whose `changes` carry added/modified/removed files and added/removed directories.
@@ -109,60 +84,23 @@ Not everything warm is incremental: every `.bundle` and `.map` request re-serial
 
 And define what forces a full revisit: `DeltaCalculator._requiresReset` exists because some changes (any symlink change, and any `package.json` change under `unstable_enablePackageExports`, the default) may invalidate resolutions Metro can't identify. Then every module in the graph is marked modified and revisited — conservative, but still emitted as an ordinary module delta. A conservative revisit is an acceptable answer — an *unsound* delta never is.
 
-### 4. Represent, don't allocate
+#### 2. Invalidation is a design output, not an afterthought
 
-At 100k+ files, per-file object overhead is the memory budget. Metro's answer is flat tuples with constant indices:
+For every cache you introduce, you must be able to answer three questions in the PR description:
 
-```js
-// metro-file-map/src/constants.js
-{MTIME: 0, SIZE: 1, VISITED: 2, SHA1: 3, SYMLINK: 4, PLUGINDATA: 5}
-// metro-file-map/src/flow-types.js (slot labels and comments elided)
-export type FileMetadata = [?number, number, 0|1, ?string, 0|1|string, ...];
-```
+1. **What invalidates it?**
+2. **How does it learn?** (a `'change'` event, a key that includes the input, or a process restart — those are the only three. An identity-keyed `WeakMap` over immutable input is the second.)
+3. **Is it conservative or precise?** Both are legitimate; being unable to say is not.
 
-Not `{mtime, size, visited, sha1, symlink}`. The header comment in `metro-file-map/src/index.js` is explicit that this is to "save storage space and reduce parse and write time".
+Metro contains several points on that spectrum, deliberately:
 
-Other instances of the same instinct, all worth copying:
+- **Coarse and correct:** `DependencyGraph._onHasteChange` throws away the entire `_resolutionCache`, invalidates `PackageCache` for every changed path, and rebuilds the module resolver on *any* file change. Resolutions depend on the existence of files that were never resolved to, so precise invalidation is genuinely hard; blowing it away is cheap relative to a rebuild and cannot serve a stale entry. But **clearing is not re-resolving**: an entry is only recomputed when `DeltaCalculator` revisits its importer, and it ignores changed paths outside the graph — so creating `Foo.ios.js` beside an already-resolved `Foo.js` changes nothing until the importer is revisited for another reason.
+- **Content-addressed:** the transform cache is never invalidated, only missed — its key changes with every input (§3).
+- **Precise by construction — don't memoize what's cheap to ask:** `PackageCache` caches only parsed `package.json` contents, evicted when a change event names the file; the closest-package question goes to `TreeFS` on every call, so there is no derived answer to go stale.
 
-- Plugins get *numbered slots* appended to the tuple (`dataIdx`, allocated from `H.PLUGINDATA`), not a nested object.
-- The symlink slot holds the target already resolved to a root-relative normal path — derived once, stored in the tuple, serializable and portable, rather than kept in a side table and re-derived (`references/serialization.md` §1).
-- `CountingSet` (`metro/src/lib/CountingSet.js`) stores `inverseDependencies` as a multiset, so that repeated edges from one parent are counted, while its `size` counts *unique* items — and that size (+1 for an entry point) *is* the module's refcount. No separate refcount field per module.
-- Derived data that's expensive but reconstructible lives in a `WeakMap` keyed on the object it derives from, so it costs nothing once that object dies — e.g. `metro-resolver` normalizes a package's `exports` once per parsed manifest (`_normalizedExportsFields`). This works because `Graph` replaces a module object, and its output, whenever the module changes.
-- Paths are stored **root-relative and normalized**, sharing the prefix implicitly via the tree rather than repeating it in every string.
-- `bulkAddOrModify` caches the last directory node because bulk file data is clustered by directory — "significantly (~30%) faster than caching all lookups in a Map, and 70% faster than no cache". Note the shape of that comment: a micro-optimization with the measurement attached.
+**Design rule:** Prefer conservative invalidation you can prove over precise invalidation you hope is complete — then make it precise behind a flag, with the coarse path still available. A cache of a file-system *answer* (existence, scope, realpath) must record everything the answer depended on, including paths that *didn't* exist and symlinks traversed; indexing an entry only under the file it found misses both (`references/caching.md`, "The traps", and the `Observations` contract in `references/file-map.md`).
 
-**Design rule:** Adding a field to `FileMetadata` for everyone is a real cost. Ask whether it belongs to a plugin slot, a lazily-computed `WeakMap`, the transform output, or nothing at all.
-
-### 5. The in-memory shape *is* the cache format
-
-This is the "cheap serialization" principle, and it is the one most often violated by well-meaning changes.
-
-`TreeFS.getSerializableSnapshot()` returns a structural clone of the live tree. `DiskCacheManager` hands it straight to `v8.serialize()`. On read, `v8.deserialize()` produces the tree, and `TreeFS.fromDeserializedSnapshot()` adopts it **as-is** — no validation, no schema migration, no object construction pass:
-
-```js
-// metro-file-map/src/index.js — trust, don't validate
-// Typed `mixed` because we've read this from an external
-// source. It'd be too expensive to validate at runtime, so
-// trust our cache manager that this is correct.
-```
-
-The consequences you must respect:
-
-- **Everything reachable from a cache must be v8-serializable**: primitives, `Array`, `Map`, `Set`, plain objects. The `V8Serializable` type in `flow-types.js` is the enforcement mechanism — plugin state and per-file plugin data are typed against it. No class instances, no closures.
-- **Test deserialized data by shape, not by class.** Under Jest, `v8.deserialize` returns host-realm `Map`s, so `instanceof Map` fails; `TreeFS` tells directory nodes from file tuples with `!Array.isArray(node)`.
-- **No JSON for large structures.** JSON of a 100k-entry map is a parse-time cliff at startup; v8 structured clone of the same data is dramatically cheaper and preserves `Map`/`Set` and `undefined`-vs-`null`.
-- **The snapshot must be portable** between root directories and operating systems — root-relative paths, and POSIX separators in the one path string inside the tree. Prove it with a cross-OS round trip, not a single-platform fixture (`references/serialization.md` §1).
-- **Writes are lazy, sequenced and debounced**, and after the first, Metro writes only in watch mode (`references/file-map.md`, "Cache manager").
-
-The same instinct runs through the bundle output side (`references/serialization.md` §4–5):
-
-- Module code is a string produced once by the transform worker and carried unchanged through the graph and the cache. The serializer never parses it, and its edits (completing the `__d(...)` call, inlining module ids) are **position-preserving**, so the worker's source map is used unadjusted.
-- A module's source map is a `VlqMap` (`{mappings, names}`), encoded once in the worker and carried through the cache and the graph as that string. Whole-bundle maps are **index maps** with one section per module, each `VlqMap` passed through verbatim — no decode, no re-encode, never re-derived from the code.
-- Consumers follow suit: the `Consumer` decodes each mapping once, in a single pass, and `/symbolicate` indexes a module once, then decodes only the line each lookup needs.
-
-**Design rule:** If serializing your structure requires a conversion pass, you designed the structure wrong. Change the structure so the wire format and the working format are the same thing — and bump the cache breaker (see §6).
-
-### 6. Cache keys are composed, content-addressed and total
+#### 3. Cache keys are composed, content-addressed and total
 
 Metro's transform cache key is the canonical example (`DeltaBundler/Transformer.js`; every term is spelled out in `references/caching.md`):
 
@@ -189,33 +127,102 @@ Read the properties off that:
 
 **Design rule:** When you add an input to any stage, you have added it to that stage's cache key. Find the key and update it in the same change, scoped to the outputs it affects. When you change a serialized *format*, or what a cached value means for the same inputs, bump the breaker in the same commit (the transform cache has no breaker constant; see `references/caching.md`, breakers). A stale-hit bug costs a user hours and gets reported as "Metro is broken".
 
-### 7. Invalidation is a design output, not an afterthought
-
-For every cache you introduce, you must be able to answer three questions in the PR description:
-
-1. **What invalidates it?**
-2. **How does it learn?** (a `'change'` event, a key that includes the input, or a process restart — those are the only three. An identity-keyed `WeakMap` over immutable input is the second.)
-3. **Is it conservative or precise?** Both are legitimate; being unable to say is not.
-
-Metro contains several points on that spectrum, deliberately:
-
-- **Coarse and correct:** `DependencyGraph._onHasteChange` throws away the entire `_resolutionCache`, invalidates `PackageCache` for every changed path, and rebuilds the module resolver on *any* file change. Resolutions depend on the existence of files that were never resolved to, so precise invalidation is genuinely hard; blowing it away is cheap relative to a rebuild and cannot serve a stale entry. But **clearing is not re-resolving**: an entry is only recomputed when `DeltaCalculator` revisits its importer, and it ignores changed paths outside the graph — so creating `Foo.ios.js` beside an already-resolved `Foo.js` changes nothing until the importer is revisited for another reason.
-- **Content-addressed:** the transform cache is never invalidated, only missed — its key changes with every input (§6).
-- **Precise by construction — don't memoize what's cheap to ask:** `PackageCache` caches only parsed `package.json` contents, evicted when a change event names the file; the closest-package question goes to `TreeFS` on every call, so there is no derived answer to go stale.
-
-**Design rule:** Prefer conservative invalidation you can prove over precise invalidation you hope is complete — then make it precise behind a flag, with the coarse path still available. A cache of a file-system *answer* (existence, scope, realpath) must record everything the answer depended on, including paths that *didn't* exist and symlinks traversed; indexing an entry only under the file it found misses both (`references/caching.md`, "The traps", and the `Observations` contract in `references/file-map.md`).
-
-### 8. Pure cores, effectful shells
+#### 4. Pure cores, effectful shells
 
 `metro-resolver` is a **pure function** of `(ResolutionContext, specifier, platform)`. It does no I/O and holds no state that can go stale; every capability it needs is a member of the context (`fileSystemLookup`, `getPackage`, `getPackageForModule`, `resolveAsset`, the Haste lookups, `schemeResolvers`, …), bound by `createModuleResolver` to `TreeFS`, `PackageCache`, `HastePlugin` and config, and assembled per call by `ModuleResolver.resolveDependency` (`ModuleResolution.js`).
 
 That purity is why resolution can be memoized at all, why `resolveRequest` can be layered on top without the core knowing, why the resolver has exhaustive unit tests over in-memory fixtures, and why resolution errors can enumerate exactly which candidates were tried (`FileCandidates`, `formatFileCandidates`). It is also why a custom `resolveRequest` should observe the file system only through the context it is given: anything it reads directly is invisible to every invalidation mechanism above.
 
-The transform worker has the same shape: a pure function of `(source, options)` plus explicitly keyed extra inputs — which is exactly what makes its output safe to content-address (§6). Anything else that reaches its output — the machine's absolute paths, the environment, which worker ran it — poisons every cache entry it lands in (`references/transformation.md`).
+The transform worker has the same shape: a pure function of `(source, options)` plus explicitly keyed extra inputs — which is exactly what makes its output safe to content-address (§3). Anything else that reaches its output — the machine's absolute paths, the environment, which worker ran it — poisons every cache entry it lands in (`references/transformation.md`).
 
 **Design rule:** New capability needed in the resolver? Add a member to `ResolutionContext`, bind it in `createModuleResolver`, and thread it through `ModuleResolution.js` (`references/resolution.md` has the checklist). Do not import `fs`, a cache, or a config object into `metro-resolver`. Same test: could this function be called twice with the same arguments and be required to return the same answer? If yes, keep it pure and cache outside it.
 
-### 9. Parallelize off the main thread, and yield when you can't
+### Performance
+
+#### 5. The file system is a data structure, not a syscall
+
+`TreeFS` (`metro-file-map/src/lib/TreeFS.js`) is an in-memory tree of `Map`s keyed on path segments, rooted at the project root, with `'..'` entries for anything outside it. Every existence check, type check, `realpath`, glob and package-scope walk in the resolution path is a walk over that tree, so **those questions cost zero syscalls.** The bounded exception in resolution is `package.json` *contents*, which `PackageCache` reads once per path and invalidates from change events.
+
+That single fact is what buys Metro:
+
+- speed (`#lookupByNormalPath` is a few `Map.get` calls plus string slicing — "this code is extremely hot during resolution, being the most expensive part of a file existence check. Benchmark any modifications!"),
+- determinism (two identical graphs resolve identically regardless of disk timing),
+- testability (fixtures are literal object trees),
+- and, crucially, **invalidation for free** — the only way file state changes is a change event, so there is exactly one place to hook.
+
+The corollary: resolution can only see the file map. A path outside its roots is `{exists: false}` however real it is on disk.
+
+**Design rule:** If you need to know something about a file, add a method to the `FileSystem` interface (`metro-file-map/src/flow-types.js`) or a `FileMapPlugin`. Never reach for `node:fs` above the file-map layer. The existing exceptions (the worker reading the file it transforms, `getSource`, the server streaming files, code frames, asset scale variants, and a few startup checks) are deliberate, sit outside every invalidation mechanism, and are listed in `references/file-map.md`. Add to them only with a reason as good.
+
+`hierarchicalLookup` is the model to copy: instead of exposing raw primitives and making callers loop, it pushes the whole "walk up until you find `package.json`, stopping at `node_modules`" pattern into one traversal that collects the ancestor nodes and the real path on the way, then checks each candidate from the node it already holds. **Push the loop into TreeFS; don't pull nodes out of it — and once you hold a node, don't re-walk from the root.**
+
+#### 6. Optimize the warm path; amortize the cold one
+
+Cold start is dominated by crawl + cache deserialization. Warm rebuild is dominated by nothing at all if you do it right — the work should be proportional to the change.
+
+Concretely, cold-start costs are paid *once* and are allowed to be expensive if they make the warm path cheap: running plugin workers over every file, building the Haste map, resolving each symlink's target when its node is populated rather than on every traversal. The converse also holds — don't pay per file for what most files never need: by default a file's sha1 is computed lazily, the first time it is transformed (`watcher.unstable_lazySha1`, default `true`), not for every crawled file. Warm-path costs are paid thousands of times and must be near-zero: a resolution cache hit, a transform cache hit keyed on content, a graph delta touching three modules.
+
+Not everything warm is incremental: every `.bundle` and `.map` request re-serializes the whole graph, and only HMR is proportional to the delta (`references/serialization.md` §4). Per-module work in a serializer is paid per module, per reload.
+
+**Design rule:** When you add work, state which path it's on. Work on the warm path needs a justification and a measurement. If you find yourself adding something per-file to the warm path, you almost certainly want it precomputed on the cold path and stored in the file map, or cached with the transform output.
+
+`RootPathUtils` exists purely because of this: `path.relative` and `path.resolve` were hot enough to matter, so Metro has specialized versions (~8x and ~20x faster respectively) that exploit the "many paths, few roots" assumption. That's the right kind of optimization — a narrower contract in exchange for a constant factor on a hot path, documented and measured where it lives.
+
+#### 7. The in-memory shape *is* the cache format
+
+This is the "cheap serialization" principle, and it is the one most often violated by well-meaning changes. Both of Metro's persistent caches store the working shape — the file map snapshot and the transform cache — and so do the bundle and its source map.
+
+The file map snapshot is the canonical case. `TreeFS.getSerializableSnapshot()` returns a structural clone of the live tree. `DiskCacheManager` hands it straight to `v8.serialize()`. On read, `v8.deserialize()` produces the tree, and `TreeFS.fromDeserializedSnapshot()` adopts it **as-is** — no validation, no schema migration, no object construction pass:
+
+```js
+// metro-file-map/src/index.js — trust, don't validate
+// Typed `mixed` because we've read this from an external
+// source. It'd be too expensive to validate at runtime, so
+// trust our cache manager that this is correct.
+```
+
+The consequences you must respect:
+
+- **Everything reachable from a cache must be v8-serializable**: primitives, `Array`, `Map`, `Set`, plain objects. The `V8Serializable` type in `flow-types.js` is the enforcement mechanism — plugin state and per-file plugin data are typed against it. No class instances, no closures.
+- **Test deserialized data by shape, not by class.** Under Jest, `v8.deserialize` returns host-realm `Map`s, so `instanceof Map` fails; `TreeFS` tells directory nodes from file tuples with `!Array.isArray(node)`.
+- **No JSON for large structures.** JSON of a 100k-entry map is a parse-time cliff at startup; v8 structured clone of the same data is dramatically cheaper and preserves `Map`/`Set` and `undefined`-vs-`null`.
+- **The snapshot must be portable** between root directories and operating systems — root-relative paths, and POSIX separators in the one path string inside the tree. Prove it with a cross-OS round trip, not a single-platform fixture (`references/serialization.md` §1).
+- **Writes are lazy, sequenced and debounced**, and after the first, Metro writes only in watch mode (`references/file-map.md`, "Cache manager").
+
+The transform cache and the bundle output follow the same rule (`references/caching.md`; `references/serialization.md` §4–5):
+
+- The transform cache stores the worker's `TransformResult` as it is — dependencies, the code string and its `VlqMap` — JSON-encoded by `FileStore` and `HttpStore`, so a hit is a parse, not a re-derivation. A per-module entry is small enough for JSON, but it must be plain JSON data to survive: no `Map`, `Set` or meaningful `undefined`.
+- Module code is a string produced once by the transform worker and carried unchanged through the graph and the cache. The serializer never parses it, and its edits (completing the `__d(...)` call, inlining module ids) are **position-preserving**, so the worker's source map is used unadjusted.
+- A module's source map is a `VlqMap` (`{mappings, names}`), encoded once in the worker and carried through the cache and the graph as that string. Whole-bundle maps are **index maps** with one section per module, each `VlqMap` passed through verbatim — no decode, no re-encode, never re-derived from the code.
+- Consumers follow suit: the `Consumer` decodes each mapping once, in a single pass, and `/symbolicate` indexes a module once, then decodes only the line each lookup needs.
+
+**Design rule:** If serializing your structure requires a conversion pass, you designed the structure wrong. Change the structure so the wire format and the working format are the same thing — and bump the cache breaker (see §3).
+
+#### 8. Represent, don't allocate
+
+At 100k+ files and tens of thousands of modules, per-item object overhead is the memory budget. The file map's answer is flat tuples with constant indices:
+
+```js
+// metro-file-map/src/constants.js
+{MTIME: 0, SIZE: 1, VISITED: 2, SHA1: 3, SYMLINK: 4, PLUGINDATA: 5}
+// metro-file-map/src/flow-types.js (slot labels and comments elided)
+export type FileMetadata = [?number, number, 0|1, ?string, 0|1|string, ...];
+```
+
+Not `{mtime, size, visited, sha1, symlink}`. The header comment in `metro-file-map/src/index.js` is explicit that this is to "save storage space and reduce parse and write time".
+
+Other instances of the same instinct, all worth copying:
+
+- Plugins get *numbered slots* appended to the tuple (`dataIdx`, allocated from `H.PLUGINDATA`), not a nested object.
+- Graph modules carry their transform output as strings — code, and a VLQ-encoded map — not ASTs or decoded mapping tuples, which at one small array per mapping are the largest single cost a dev server's heap can carry (`references/serialization.md` §5).
+- `CountingSet` (`metro/src/lib/CountingSet.js`) stores `inverseDependencies` as a multiset, so that repeated edges from one parent are counted, while its `size` counts *unique* items — and that size (+1 for an entry point) *is* the module's refcount. No separate refcount field per module.
+- Derived data that's expensive but reconstructible lives in a `WeakMap` keyed on the object it derives from, so it costs nothing once that object dies — e.g. `metro-resolver` normalizes a package's `exports` once per parsed manifest (`_normalizedExportsFields`). This works because `Graph` replaces a module object, and its output, whenever the module changes.
+- Paths are stored **root-relative and normalized**, sharing the prefix implicitly via the tree rather than repeating it in every string.
+- `bulkAddOrModify` caches the last directory node because bulk file data is clustered by directory — "significantly (~30%) faster than caching all lookups in a Map, and 70% faster than no cache". Note the shape of that comment: a micro-optimization with the measurement attached.
+
+**Design rule:** Adding a field to `FileMetadata`, or to every `Module`, is a real cost. Ask whether it belongs to a plugin slot, a lazily-computed `WeakMap`, the transform output, or nothing at all.
+
+#### 9. Parallelize off the main thread, and yield when you can't
 
 The Metro server must stay responsive while building. So:
 
@@ -232,12 +239,12 @@ The Metro server must stay responsive while building. So:
 Work through this before writing code. It's roughly the order a reviewer will ask about.
 
 1. **Which layer owns this?** File map / resolution / transformation / graph / serialization / server. If your change spans layers, that's the first thing to question — most cross-layer designs in Metro are better expressed as an addition to a lower layer's interface. If it's in an area with an unused or gated mechanism, build on that rather than a parallel one ([Unused and gated mechanisms](#unused-and-gated-mechanisms)).
-2. **What's the warm-path cost?** Per rebuild, per module, per resolution — and per request, if it's in a serializer. If it's non-zero, what makes it worth it?
-3. **What's the delta behavior?** What happens on one changed file? On a deleted file? On an added file that didn't exist when a resolution failed? On a `package.json` change? On a symlink change? On a change that lands while a build is in flight? For a module with no file, what revisits it when its content changes?
-4. **What's the memory cost at 100k files?** Per-file bytes × file count. Can it be a plugin slot, a `WeakMap`, part of the transform output, or lazily computed instead?
-5. **Does it cross a cache boundary?** If so: is it in the key (scoped to the outputs it affects), is the value serializable in that cache's format (v8 for the file-map snapshot, JSON for transform results in `FileStore`/`HttpStore`), is the breaker bumped, and does it stay portable across machines and OSes?
-6. **What invalidates it, how does it learn, conservative or precise?** (§7)
-7. **Does it need to be pure?** If it's in `metro-resolver`, a scheme resolver or a transform worker, yes.
+2. **What's the delta behavior?** What happens on one changed file? On a deleted file? On an added file that didn't exist when a resolution failed? On a `package.json` change? On a symlink change? On a change that lands while a build is in flight? For a module with no file, what revisits it when its content changes?
+3. **If it caches or derives anything: what invalidates it, how does it learn, conservative or precise?** (§2)
+4. **Does it cross a cache boundary?** If so: is it in the key (scoped to the outputs it affects), is the value serializable in that cache's format (v8 for the file-map snapshot, JSON for transform results in `FileStore`/`HttpStore`), is the breaker bumped, and does it stay portable across machines and OSes?
+5. **Does it need to be pure?** If it's in `metro-resolver`, a scheme resolver or a transform worker, yes.
+6. **What's the warm-path cost?** Per rebuild, per module, per resolution — and per request, if it's in a serializer. If it's non-zero, what makes it worth it?
+7. **What's the memory cost at 100k files?** Per-file bytes × file count. Can it be a plugin slot, a `WeakMap`, part of the transform output, or lazily computed instead?
 8. **Is it configurable, and does the config reach the cache key?** A new `metro-config` option needs a type, a default, validation, a merge rule if it's an object or function, docs in `docs/Configuration.md`, the API snapshot, and — if it affects output — a place in the relevant cache key (only `transformer.*` options are keyed automatically, and only by a transformer that hashes its config; `references/caching.md`). A new *per-request* option (a bundle URL parameter) must also go into `getGraphId`; config needn't, as it's fixed for a server's lifetime (`references/graph.md`, "A bundle request, end to end" and "Configuration").
 9. **Does it change what's in the bundle?** The worker's wrapping, the serializer, `metro-runtime`'s `require.js` and custom serializers all depend on the `__d` contract and the bundle layout, and the bundle and its source map must agree (`references/serialization.md`).
 10. **Public API?** Root exports are the stable surface, gated by committed `API.md` snapshots (`yarn build-api-snapshots`, checked in CI); TS defs are generated (`yarn build-ts-defs`). `<pkg>/private/*` is Metro's explicit unstable tier — don't invent another. Prefix options not yet committed to with `unstable_`.
@@ -251,7 +258,7 @@ Work through this before writing code. It's roughly the order a reviewer will as
 | `fs.existsSync` / `statSync` above the file map | Bypasses the virtual FS: unwatched, uninvalidated, slow, non-deterministic | `fileSystemLookup` / a `FileSystem` method |
 | A `Map` keyed on absolute path, cleared "somewhere" | Unbounded growth, unclear invalidation | Attach to an existing cache with a defined lifetime and invalidation hook |
 | Memoizing a `TreeFS` answer beneath the resolution cache | Misses a nearer file added later or a symlink retargeted | Ask `TreeFS` each time; if that's too slow, record what each entry observed and invalidate on it |
-| `JSON.stringify` a large structure to cache it | Parse cliff at startup; loses `Map`/`Set` and `undefined` | v8 serialize the live structure (§5) |
+| `JSON.stringify` a large structure to cache it | Parse cliff at startup; loses `Map`/`Set` and `undefined` | v8 serialize the live structure (§7) |
 | `instanceof` on deserialized data | Fails across realms (e.g. under Jest) | Test by shape (`Array.isArray`) |
 | Absolute paths or `\` separators in a cache key or snapshot | Kills remote-cache hits and cross-platform sharing | Project-relative, posix-normalized |
 | mtime in a cache key | Touch-without-change becomes a miss; CI never hits | sha1 of contents |

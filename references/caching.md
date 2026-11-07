@@ -116,7 +116,7 @@ What counts as a content change, by example: storing a symlink's target lexicall
 
 ## Designing invalidation
 
-Answer SKILL.md §7's three questions — what invalidates it, how it learns (a key, a `'change'` event, or a restart), conservative or precise — in the PR description. SKILL.md §7 also walks through Metro's own answers, from the wholesale `_resolutionCache` clear to the content-addressed transform cache.
+Answer SKILL.md §2's three questions — what invalidates it, how it learns (a key, a `'change'` event, or a restart), conservative or precise — in the PR description. SKILL.md §2 also walks through Metro's own answers, from the wholesale `_resolutionCache` clear to the content-addressed transform cache.
 
 ### The traps
 

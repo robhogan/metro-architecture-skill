@@ -77,7 +77,7 @@ Every call form but `import()` must name an unbound global. The three forms that
 
 ## Purity
 
-Output, dependencies included, is a pure function of the file's bytes and project-relative path, the `JsTransformOptions`, the transformer config, an asset's `assetUrlPath` and whatever the transformer's `getCacheKey` hashes (SKILL.md §8). The cache depends on that (`references/caching.md`), and so does `Graph`: `transformOutputMayDiffer` keeps the previous module when `unstable_transformResultKey` is unchanged, so new output under an unchanged key is discarded, even with `cacheStores: []`. That rules out:
+Output, dependencies included, is a pure function of the file's bytes and project-relative path, the `JsTransformOptions`, the transformer config, an asset's `assetUrlPath` and whatever the transformer's `getCacheKey` hashes (SKILL.md §4). The cache depends on that (`references/caching.md`), and so does `Graph`: `transformOutputMayDiffer` keeps the previous module when `unstable_transformResultKey` is unchanged, so new output under an unchanged key is discarded, even with `cacheStores: []`. That rules out:
 
 - **Other files.** A transform receives one file; whatever else it reads is in no key and triggers no invalidation (the existing cases are `references/caching.md`'s known gaps). Information from other modules belongs in the graph or the serializer, or arrives as a keyed option.
 - **Environment and worker state.** `process.env` is unkeyed and `JEST_WORKER_ID` is deleted (`references/graph.md`, "Workers"). Likewise no state may carry from one file to the next: which files a worker sees is scheduling.
