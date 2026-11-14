@@ -95,6 +95,8 @@ interface CacheStore<T> {
 
 Typical config: local `FileStore` first, remote second (`docs/Caching.md`). Default: one `FileStore` at `os.tmpdir()/metro-cache`.
 
+These stores serve the transform cache only. The file map is shared remotely through a custom `CacheManager` instead (`references/file-map.md`, "Remote file map cache").
+
 ## Cache breakers and versions
 
 | Knob | Scope | Bump when |
