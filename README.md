@@ -14,5 +14,5 @@ git clone https://github.com/robhogan/metro-architecture-skill.git ~/.claude/ski
 
 ## Layout
 
-- `SKILL.md` — the pipeline, the seams table, nine principles, a design checklist and anti-patterns.
+- `SKILL.md` — the pipeline, nine principles, a design checklist, anti-patterns and a table of unused and gated mechanisms.
 - `references/` — deep dives on the file map, resolution, transformation, caching, the incremental graph and server, and serialization and the runtime contract.

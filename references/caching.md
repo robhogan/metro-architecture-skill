@@ -6,6 +6,7 @@
 |---|---|---|---|---|---|
 | **File map snapshot** | `metro-file-map/src/cache/DiskCacheManager.js` | file name from `rootDirHash` (absolute `rootDir`) + `relativeConfigHash` (root-relative `BuildParameters` incl. `CACHE_BREAKER`, plus plugins' `getCacheKey()`) — `lib/rootRelativeCacheKeys.js` | v8-serialized `CacheData` (`TreeFS` tree, clocks, plugin state) | on disk, forever | crawl delta at startup; different config ⇒ different file; files under `addRoot` roots aren't keyed: any that a later auto-save writes are dropped on read and re-crawled |
 | **Transform results** | `metro/src/DeltaBundler/Transformer.js` → `metro-cache/src/Cache.js` → `cacheStores` | `stableHash([baseHash, relPath, assetUrlPath, …transform options]) ++ sha1(content)` | `TransformResult` | on disk / remote, forever | content-addressed — never invalidated, only missed |
+| **Shared transform results** | `metro/src/DeltaBundler/SharedTransformResults.js`, checked before `cacheStores` | the module (the key without the content hash), holding the full key of its latest result | that result's `output` and `dependencies`, the objects every graph holding the module uses | until no live graph holds it | content-addressed like the stores; an edit replaces the module's entry, and released paths drop entries no graph holds (`references/graph.md`, "Shared transform results") |
 | **Transform base hash** | `Transformer` constructor → `getTransformCacheKey` | — | `_baseHash` | process | restart only: every file the transformer's `getCacheKey` hashes, Babel config files and Metro's `@babel/runtime/package.json` are read once, so editing them under a running server changes no key |
 | **Resolutions** | `DependencyGraph._resolutionCache` | `canonicalize(resolverOptions) → originDir → name + '\0esm'/'\0cjs' → platform` (a virtual result: origin *file* in place of `originDir`) | `BundlerResolution` (errors are thrown, not cached) | process | **cleared wholesale on any file change** |
 | **`package.json` contents** | `node-haste/PackageCache.js` | `package.json` path as asked for | parsed JSON + `rootPath` | process (survives `_resolutionCache` clears and graph resets) | `invalidate(path)` from `_onHasteChange` for every changed file; the closest scope is not cached (`references/resolution.md` §2, including a symlink gap) |
@@ -16,7 +17,7 @@
 | **Dynamic roots** | `DependencyGraph.getDynamicRoots()` | `FileMap.getRoots()` array identity | `DynamicRoot[]` | process | a new roots array from `FileMap.addRoot` |
 | **Module graph revisions** | `metro/src/IncrementalBundler.js` | `getGraphId(...)`; also revision id | `GraphRevision` | until `endGraph` (an HTTP `DELETE` of the bundle) or a failed initial build — otherwise unbounded | change events accumulate in `DeltaCalculator`; the graph is updated on the next request, minting a new revision id for a non-empty delta |
 | **Module ids** | `Server._createModuleId` (`createModuleIdFactory`) | module path | number | process | never — ids must be stable within a server lifetime |
-| **Symbolication line index** | `Server/symbolicate.js` | a module's `VlqMap` **by identity** (`WeakMap`) | `LineIndexedMappings` | until the module leaves the graph or is re-transformed | identity — a re-transformed module has a new `VlqMap` |
+| **Symbolication line index** | `Server/symbolicate.js` | a module's `VlqMap` **by identity** (`WeakMap`) | `LineIndexedMappings` | until nothing holds the `VlqMap`: no graph's module and no shared result | identity — a changed module has a new `VlqMap` |
 | **Cache-store hit provenance** | `metro-cache/src/Cache.js` `#hits` | the key `Buffer` **by identity** (`WeakMap`) | the store that hit | until the Buffer is GC'd | n/a |
 
 ## Key composition — the rules
@@ -29,7 +30,7 @@ baseHash   = stableHash([ getTransformCacheKey({cacheVersion, projectRoot, trans
              //   ∥ md5(transformer module file contents) ∥ Transformer.getCacheKey?.(transformerConfig) ∥ globalPrefix
              //   computed once, in the Transformer constructor
              // transformerConfig = config.transformer − getTransformOptions, transformVariants,
-             //   unstable_supportsInlineModules, unstable_workerThreads
+             //   unstable_shareTransformResults, unstable_supportsInlineModules, unstable_workerThreads
              //   + unstable_supportsInlineModules: true when resolver.unstable_allowVirtualModules
 partialKey = stableHash([ baseHash, posix(projectRelativePath),
                           assetUrlPath,   // assets only, else null
@@ -40,7 +41,7 @@ partialKey = stableHash([ baseHash, posix(projectRelativePath),
 fullKey    = Buffer.concat([partialKey, sha1(contents)])   // contents: the file, or the caller's fileBuffer
 ```
 
-The default transformer's `getCacheKey` (`metro-transform-worker`) hashes its own entry file and seven helpers (`getMinifier`, `assetTransformer`, `collectDependencies`, `generateImportNames`, `JsFileWrapping`, `reservedString`, `importLocationsPlugin`), the *entry files* of the Babel transformer and minifier, Metro's transform plugins (the `metro-transform-plugins` index and its five plugin files), Metro's own `@babel/runtime/package.json` when `enableBabelRuntime === true` (the default — so upgrading it misses every transform), `stableHash` of the rest of the transformer config (as in the block above), and the Babel transformer's `getCacheKey` (for `metro-babel-transformer`, the contents of the root Babel config files). A new JSON-serializable `transformer.*` option is keyed for free; other config isn't, until it is injected into the transformer config or added to `getTransformCacheKey` (as `globalPrefix` is). `resolver.unstable_allowVirtualModules` is keyed the first way: Metro sets `unstable_supportsInlineModules` from it, overriding any configured value, and the worker passes it to Babel as the caller's `supportsInlineModules`, so a plugin emits `metro:inline` specifiers only when they resolve ("Babel plugins can emit different code for this, so it must be part of the transform cache key.").
+The default transformer's `getCacheKey` (`metro-transform-worker`) hashes its own entry file and seven helpers (`getMinifier`, `assetTransformer`, `collectDependencies`, `generateImportNames`, `JsFileWrapping`, `reservedString`, `importLocationsPlugin`), the *entry files* of the Babel transformer and minifier, Metro's transform plugins (the `metro-transform-plugins` index and its five plugin files), Metro's own `@babel/runtime/package.json` when `enableBabelRuntime === true` (the default — so upgrading it misses every transform), `stableHash` of the rest of the transformer config (as in the block above), and the Babel transformer's `getCacheKey` (for `metro-babel-transformer`, the contents of the root Babel config files). A new JSON-serializable `transformer.*` option is keyed for free; other config isn't, until it is injected into the transformer config or added to `getTransformCacheKey` (as `globalPrefix` is). `resolver.unstable_allowVirtualModules` is keyed the first way: Metro injects it as `unstable_supportsInlineModules`, which the worker passes to Babel as caller data ("Babel plugins can emit different code for this, so it must be part of the transform cache key.").
 
 1. **Content, not mtime.** `sha1` comes from `getOrComputeSha1`, which returns any sha1 already in the tuple (from Watchman, an eager crawl, the snapshot or an earlier lazy computation) and otherwise hashes the file. When a caller supplies `fileBuffer` — a `require.context` module's rendered template, or a virtual module's source — `Transformer` hashes that instead. A touched-but-unchanged file is a hit; CI and dev machines share entries.
 2. **Portable.** Project-relative, `posix`-separated. An absolute path or a `\` in a key silently destroys remote-cache hit rate — the bundle still builds, so nobody notices for months. A portable key doesn't make the *output* portable, though: a Babel plugin that embeds `state.filename` (absolute, resolved against `projectRoot`) bakes the producing machine's path into a shared entry.
@@ -72,9 +73,8 @@ An asset's output bakes in its URL path (`httpServerLocation`), and an asset out
 // enters the cache key per asset here and not in the base hash.
 ```
 
-- Root-relative and posix, so portable. "The first root to contain the asset wins, in index order", so appending a watch folder never changes an existing asset's URL or key.
-- Metro's transformer reports the path it baked in as `unstable_assetUrlPath` on the asset's output, and `getAssets` reads it back rather than recomputing it (`references/graph.md`, "URLs and roots"). The path rides in the cached `TransformResult`, which is sound only because it is keyed. Scales, files and hash are still re-read by `getAssets`, so a stale cached transform (the scale-variant gap) can list different variants from the ones a release build copies.
-- An asset under no configured root falls back to a **dynamic root** id — 8 hex digits of a sha1 of the root's project-relative posix path (`metro/src/lib/dynamicRoots.js`), independent of other roots and their order, so still portable. How often this path is taken depends on which dynamic roots exist (SKILL.md's "Unused and gated mechanisms"); Metro's own runtime packages ship no assets.
+- Root-relative and posix, so portable. "The first root to contain the asset wins, in index order", so appending a watch folder never changes an existing asset's URL or key. An asset under no configured root takes its dynamic root's hashed id, which is portable too (`references/graph.md`, "URLs and roots").
+- Metro's transformer bakes in the path it receives (the project-relative path if it gets none) and reports it as `unstable_assetUrlPath` on the asset's output. `getAssets`, what a build tool saves, reads it back rather than recomputing it, so the bundle and the saved assets agree even under a wrapper transformer that drops the argument, and `getAssets` needs no roots. That is sound only because the path is keyed. Scales, files and hash are still re-read by `getAssets`, so a stale cached transform (the scale-variant gap) can list different variants from the ones a release build copies.
 
 ## Cache stores — `metro-cache/src/stores/`
 
@@ -89,11 +89,13 @@ interface CacheStore<T> {
 
 - `FileStore({root})` — `root/<first byte hex>/<rest hex>`. A `Buffer` value is stored raw behind a leading `BINARY_MARKER` (`0x01`, a byte no JSON document begins with); anything else is JSON. `ENOENT` or a `SyntaxError` on read is a miss, not an error, and a zero-filled file left by a failed write fails to parse, so it misses too — **a corrupt local entry degrades to a miss, never a crash.**
 - `AutoCleanFileStore` (deprecated) — `FileStore` + periodic sweep.
-- `HttpStore({endpoint, timeout, family, cert, ca, key, …})` or `{getOptions, setOptions}` — gzipped `GET`/`PUT`, with opt-in retries (`maxAttempts` defaults to 1). On read only a 404 is a miss: any other status outside `additionalSuccessStatuses` (which read as a 200), a network error, or a body that fails to gunzip or parse rejects.
-- `HttpGetStore` is the read-only variant for dev machines: it turns HTTP and network errors into a miss plus one warning, but an undecodable body still rejects.
+- `HttpStore({endpoint, timeout, maxSockets, family, cert, ca, key, …})` or `{getOptions, setOptions}` — gzipped `GET`/`PUT` over a keep-alive agent (`maxSockets`, default 64; a request waiting for a socket is still timed), with opt-in retries (`maxAttempts` defaults to 1). `getParams`, for short-lived credentials, adds query parameters before each request. On read only a 404 is a miss: any other status outside `additionalSuccessStatuses` (which read as a 200), a network error, or a body that fails to gunzip or parse rejects.
+- `HttpGetStore` is the read-only variant for dev machines: it turns HTTP and network errors into a miss plus one warning, but an undecodable body still rejects. With `maxInFlightReads`, a read beyond that many outstanding misses at once instead of queueing.
 - `Cache(stores)` reads in order, first hit wins, and writes to all stores **before** the one that hit. Write failures are collected into an `AggregateError` and surfaced via `cache_write_error`, and writes are fire-and-forget, so a failing remote never breaks the build through `set`. A `get` that *throws* fails the transform (`cache_read_error`) — so with a plain `HttpStore`, an unreachable remote fails every transform that misses the stores before it (with the usual local `FileStore` first, every local miss). Stores must turn expected failures into misses.
 
 Typical config: local `FileStore` first, remote second (`docs/Caching.md`). Default: one `FileStore` at `os.tmpdir()/metro-cache`.
+
+**A slow store delays the whole build, not just one file**: `buildSubgraph` learns a module's dependencies only from its transform result (`references/graph.md`), so a read stuck in a socket queue stalls everything beneath that module while workers idle. `unstable_hedgeCacheReadsAfterMs` (top-level config, off by default) bounds the wait: a read that hasn't answered in time also queues a speculative local transform, and whichever result arrives first wins. Speculative transforms take only free worker slots (`TransformSlots`), are withdrawn if the read hits before they start, and become required on a miss; a read that *throws* still fails the transform. Pair it with `maxInFlightReads`, so excess reads go local at once.
 
 These stores serve the transform cache only. The file map is shared remotely through a custom `CacheManager` instead (`references/file-map.md`, "Remote file map cache").
 
@@ -101,7 +103,7 @@ These stores serve the transform cache only. The file map is shared remotely thr
 
 | Knob | Scope | Bump when |
 |---|---|---|
-| `CACHE_BREAKER` in `metro-file-map/src/index.js` (currently `'14'`) | file map snapshot | the file-map data structure or its content changes for a given FS state — Metro's version isn't in this key, so nothing else separates releases |
+| `CACHE_BREAKER` in `metro-file-map/src/index.js` (currently `'15'`) | file map snapshot | the file-map data structure or its content changes for a given FS state — Metro's version isn't in this key, so nothing else separates releases |
 | `FileMapPlugin.getCacheKey()` | that plugin's data | the plugin's extraction logic or its user-supplied module changes |
 | `FileDataPlugin`'s `cacheKey` option | that plugin's data | as above — and when flipping `lazy` or changing `filter`, neither of which `FileDataPlugin` keys itself |
 | `MockPlugin`'s `CACHE_VERSION` (`RawMockMap.version`) | mock map | mock map format changes (a mismatch rebuilds from files) |
@@ -112,7 +114,7 @@ These stores serve the transform cache only. The file map is shared remotely thr
 
 `transformer.globalPrefix` is also in `baseHash`, but it isn't a cache knob: it prefixes the module-system globals (`${globalPrefix}__d`), so it changes the bundle, which is why it's keyed.
 
-What counts as a content change, by example: storing a symlink's target lexically resolved to a normal POSIX path, leaving plugin slots `undefined` until a worker has run, so that `null` is a real result, and resolving a cross-drive symlink's relative target on the symlink's own drive. Each changed what a cached tuple means for the same file-system state, so each bumped the breaker. Changing which files an eager plugin runs on is the same kind of change: a snapshot written before it holds `undefined` slots that now read as `null`.
+What counts as a content change, by example: storing a symlink's target lexically resolved to a normal POSIX path, or leaving plugin slots `undefined` until a worker has run, so that `null` is a real result. Each changed what a cached tuple means for the same file-system state, so each bumped the breaker. Changing which files an eager plugin runs on is the same kind of change: a snapshot written before it holds `undefined` slots that now read as `null`.
 
 **Bump the breaker in the same commit as the format change.** A stale hit is the worst failure mode Metro has: it produces a wrong bundle, silently, and the user's only recourse is `--reset-cache`, which they'll then apply forever.
 
@@ -139,5 +141,6 @@ Answer SKILL.md §2's three questions — what invalidates it, how it learns (a 
 1. `--reset-cache` — if it fixes it, it's invalidation, not logic. It skips the file-map snapshot and `clear()`s every store, but `HttpStore.clear()` is "Not implemented": a bad remote entry survives it.
 2. `DEBUG='Metro:*'` — `Metro:Transformer` logs the base hash; `Metro:FileMapCache` logs the cache path on write; `Metro:FileMap` logs lazily-processed files.
 3. Delete only the file-map cache (path from `DiskCacheManager.getCacheFilePath()`) to separate file-map staleness from transform staleness.
-4. `cacheStores: []` disables the transform cache entirely (`Cache.isDisabled`, which also skips computing the global cache key).
-5. Check whether the changed input is in the key at all — that is nearly always the answer — and whether it's one of the known gaps.
+4. `cacheStores: []` disables the stores (`Cache.isDisabled`, which also skips computing the global cache key), but not shared transform results: a module whose key is unchanged still isn't transformed again while a graph holds it.
+5. If output differs between graphs, or changes after a serializer or plugin has run, suspect a write to shared module data: retry with `transformer.unstable_shareTransformResults: false`.
+6. Check whether the changed input is in the key at all — that is nearly always the answer — and whether it's one of the known gaps.

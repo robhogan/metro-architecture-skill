@@ -1,12 +1,12 @@
 ---
 name: metro-architecture
 description: |
-    Metro's core architecture and the design principles behind it — the virtualized file system (metro-file-map / TreeFS, crawlers, watcher backends), fast in-memory resolution (metro-resolver, DependencyGraph, package exports, the `metro:` scheme), transformation (the transform worker, Babel transformer, Metro's Babel plugins, dependency collection), the layered cache system and its invalidation model, incremental graph traversal (DeltaBundler, require.context and virtual modules), and cheap serialization (v8 snapshots, tuple metadata, the bundle layout and runtime contract, VLQ module maps composed as index source maps, symbolication, HMR). This is the STARTING POINT for designing, reviewing or debugging any change to Metro core — read it before proposing an approach, not after. Triggers on any work in react/metro (formerly facebook/metro) or the `metro-*` packages: "add a resolver option", "why is Metro slow to start", "cache isn't invalidating", "add a field to the file map", "make this incremental", "design X in Metro", "review this Metro PR", "should this be cached", "watch mode isn't picking up changes", "source map is off by a line", "add a transform option", plus anything touching TreeFS, HastePlugin, Watchman / NativeWatcher / FallbackWatcher, DeltaCalculator, Graph, Transformer, metro-transform-worker, collectDependencies, inline requires, serializers, metro-runtime, source maps, HMR, the server, metro-config, or cacheStores.
+    Metro's core architecture and the design principles behind it — the virtualized file system (metro-file-map / TreeFS, crawlers, watcher backends), fast in-memory resolution (metro-resolver, DependencyGraph, package exports, the `metro:` scheme), transformation (the transform worker, Babel transformer, Metro's Babel plugins, dependency collection), the layered cache system and its invalidation model, incremental graph traversal (DeltaBundler, lazy bundles, require.context), and cheap serialization (v8 snapshots, tuple metadata, the bundle layout and runtime contract, VLQ module maps composed as index source maps, symbolication, HMR). This is the STARTING POINT for designing, reviewing or debugging any change to Metro core — read it before proposing an approach, not after. Triggers on any work in react/metro (formerly facebook/metro) or the `metro-*` packages: "add a resolver option", "why is Metro slow to start", "cache isn't invalidating", "add a field to the file map", "make this incremental", "design X in Metro", "review this Metro PR", "should this be cached", "watch mode isn't picking up changes", "source map is off by a line", "add a transform option", plus anything touching TreeFS, HastePlugin, Watchman / NativeWatcher / FallbackWatcher, DeltaCalculator, Graph, Transformer, metro-transform-worker, collectDependencies, inline requires, serializers, metro-runtime, source maps, HMR, the server, metro-config, or cacheStores.
 ---
 
 # Metro core architecture
 
-> **Provenance.** Derived from `react/metro` at [`4159bf41f092b5ce47252fe47808ddddf44f5ef1`](https://github.com/react/metro/commit/4159bf41f092b5ce47252fe47808ddddf44f5ef1) — the commit after Metro 0.88.0, committed **2026-11-06**, last verified **2026-11-07**. Covers this file and everything in `references/`. Before updating it, read [Maintaining this skill](#maintaining-this-skill).
+> **Provenance.** Derived from `react/metro` at [`ba761edb1335d86cd8d643515e1841c1e7ea98cd`](https://github.com/react/metro/commit/ba761edb1335d86cd8d643515e1841c1e7ea98cd) — `main` after Metro 0.88.0, committed **2026-11-20**, last verified **2026-11-21**. Covers this file and everything in `references/`. Before updating it, read [Maintaining this skill](#maintaining-this-skill).
 
 Metro is a **long-lived, incremental, content-addressed bundler for very large repos**. Every architectural decision in it falls out of that one sentence. Before you design anything here, internalize the problem shape:
 
@@ -37,6 +37,7 @@ DependencyGraph                               packages/metro/src/node-haste/Depe
         ▼
 Transformer (main thread)                     packages/metro/src/DeltaBundler/Transformer.js
    ├─ key = stableHash(config ∥ path ∥ options) ++ sha1(content)
+   ├─ SharedTransformResults: one in-memory result per module, shared between graphs
    ├─ Cache(cacheStores)                      packages/metro-cache/src/Cache.js
    └─ WorkerFarm ──► metro-transform-worker   packages/metro-transform-worker/src/index.js  (PURE)
         Babel transformer → Metro's plugins → collectDependencies → wrap in __d → minify
@@ -172,7 +173,7 @@ Not everything warm is incremental: every `.bundle` and `.map` request re-serial
 
 This is the "cheap serialization" principle, and it is the one most often violated by well-meaning changes. Both of Metro's persistent caches store the working shape — the file map snapshot and the transform cache — and so do the bundle and its source map.
 
-The file map snapshot is the canonical case. `TreeFS.getSerializableSnapshot()` returns a structural clone of the live tree. `DiskCacheManager` hands it straight to `v8.serialize()`. On read, `v8.deserialize()` produces the tree, and `TreeFS.fromDeserializedSnapshot()` adopts it **as-is** — no validation, no schema migration, no object construction pass:
+The file map snapshot is the canonical case. `FileMap` gives the cache manager the live tree itself (`TreeFS.getSerializableState()`), not a copy, and `DiskCacheManager` hands it straight to `v8.serialize()`, synchronously, so nothing can change it in between. On read, `v8.deserialize()` produces the tree, and `TreeFS.fromDeserializedSnapshot()` adopts it **as-is** — no validation, no schema migration, no object construction pass:
 
 ```js
 // metro-file-map/src/index.js — trust, don't validate
@@ -187,7 +188,7 @@ The consequences you must respect:
 - **Test deserialized data by shape, not by class.** Under Jest, `v8.deserialize` returns host-realm `Map`s, so `instanceof Map` fails; `TreeFS` tells directory nodes from file tuples with `!Array.isArray(node)`.
 - **No JSON for large structures.** JSON of a 100k-entry map is a parse-time cliff at startup; v8 structured clone of the same data is dramatically cheaper and preserves `Map`/`Set` and `undefined`-vs-`null`.
 - **The snapshot must be portable** between root directories and operating systems — root-relative paths, and POSIX separators in the one path string inside the tree. Prove it with a cross-OS round trip, not a single-platform fixture (`references/serialization.md` §1).
-- **Writes are lazy, sequenced and debounced**, and after the first, Metro writes only in watch mode (`references/file-map.md`, "Cache manager").
+- **Writes are lazy, sequenced and debounced**, and after the first, Metro writes only in watch mode (`references/file-map.md`, "Cache manager"). A cache manager that serializes later must copy first, since what it is given is live.
 
 The transform cache and the bundle output follow the same rule (`references/caching.md`; `references/serialization.md` §4–5):
 
@@ -206,7 +207,7 @@ At 100k+ files and tens of thousands of modules, per-item object overhead is the
 // metro-file-map/src/constants.js
 {MTIME: 0, SIZE: 1, VISITED: 2, SHA1: 3, SYMLINK: 4, PLUGINDATA: 5}
 // metro-file-map/src/flow-types.js (slot labels and comments elided)
-export type FileMetadata = [?number, number, 0|1, ?string, 0|1|string, ...];
+export type FileMetadata = [?number, ?number, 0|1, ?string, 0|1|string, ...];
 ```
 
 Not `{mtime, size, visited, sha1, symlink}`. The header comment in `metro-file-map/src/index.js` is explicit that this is to "save storage space and reduce parse and write time".
@@ -269,6 +270,7 @@ Work through this before writing code. It's roughly the order a reviewer will as
 | Full graph rebuild on an event you could have deltaed | O(project) per keystroke | Route it through `DeltaCalculator` |
 | Caching state that can go stale in `metro-resolver` | Breaks purity, testability, and the caller's invalidation | Cache in `DependencyGraph`; keep the resolver pure (an identity-keyed `WeakMap` over immutable input, like `_normalizedExportsFields`, is fine) |
 | Treating a `Module.path` as a file path | A module path may be a context module's `<dir>?ctx=…` or a virtual module's `virtual:<path>` | The helpers in `lib/modulePath.js` (`references/graph.md`, "Module paths") |
+| Writing to a module's `output` or a dependency's `data` | Graphs with equal transform options share one copy of each by default, so the write lands in every graph | Treat them as read-only, as their types declare, and copy what you need to change (`references/graph.md`, "Shared transform results") |
 | A serializer edit that moves mapped code | Every later mapping in the module, or every later section, points at the wrong place | Keep line counts and mapped columns (pad, insert at the end), or produce a map for the edit |
 | Precise invalidation with no proof of completeness | Stale resolution, reported as "Metro can't find my file" | Coarse invalidation now, precise behind a flag later |
 | A micro-optimization with no measurement | The hot paths here are counter-intuitive | Benchmark it and put the number in a comment, as the existing hot paths do |
@@ -285,17 +287,18 @@ Landed mechanisms that are partly or wholly unused, or off by default, at the pi
 | Virtual modules (`VirtualResolution`, `virtual:` paths, `metro:inline`) | `references/resolution.md`, `references/graph.md` | Off by default (`resolver.unstable_allowVirtualModules`). Nothing in Metro emits `metro:inline`; Babel plugins do, told by `supportsInlineModules` caller data. The server serves no virtual module by URL ("Virtual modules cannot be requested by URL yet."), so a lazily imported one can't load. |
 | `serializer.unstable_lazilyDefineModules` / `baseJSBundleWithLazyModuleDefinition` | `references/serialization.md` | Nothing reads the option and `Server` never calls the serializer, though `docs/Configuration.md` documents the option. |
 | `reservedString` (`_$$_METRO_`) placeholders | `references/serialization.md` | No Metro serializer reads it; the worker emits `_$$_METRO_MODULE_ID` only under `customTransformOptions.unstable_staticHermesOptimizedRequire`, for a custom serializer. |
+| Hedged cache reads (`unstable_hedgeCacheReadsAfterMs`) and `HttpGetStore`'s `maxInFlightReads` | `references/caching.md` | Off by default (`null`, and no limit). Meant for remote stores. |
 
 ## Reference files
 
 Load these when the work goes deep on a subsystem:
 
-- `references/file-map.md` — lifecycle, TreeFS internals, path terminology, the `FileSystem` interface and its deliberate `fs` exceptions, plugins and the plugin data API, crawlers, watchers and their filtering, the cache manager, `FileProcessor`, roots and `addRoot`, the `Observations` seam.
+- `references/file-map.md` — lifecycle, TreeFS internals, path terminology, the `FileSystem` interface and its deliberate `fs` exceptions, `FileMetadata` and lazily stat'd files, plugins and the plugin data API, crawlers, watchers and their filtering, the cache manager and remote file map caches, `FileProcessor`, roots and `addRoot`, the `Observations` seam.
 - `references/resolution.md` — the resolution algorithm, `ResolutionContext`, package scope, Haste, package exports and `browser` ordering, the `metro:` scheme and its defaults, assets, errors, the caching and invalidation layers around it and their gaps, and virtual resolutions.
 - `references/transformation.md` — the main-thread and worker halves, `getTransformOptions`, the JS, JSON and asset paths, the order of the JS pipeline, `collectDependencies` and dependency keys, purity, and the contract a custom transformer must meet.
-- `references/caching.md` — every cache in Metro, its key, its lifetime and its invalidation, in one table; the transform key in full and its known gaps; asset URL paths as a scoped key input; cache stores and remote caching; breakers; the traps; debugging.
+- `references/caching.md` — every cache in Metro, its key, its lifetime and its invalidation, in one table; the transform key in full and its known gaps; asset URL paths as a scoped key input; cache stores, remote caching and hedged reads; breakers; the traps; debugging.
 - `references/serialization.md` — v8 snapshots and their portability contract, tuple metadata, `V8Serializable`, the bundle layout and runtime contract, position-preserving serializer edits, bundle/map agreement, VLQ module maps and index source maps, consuming maps, symbolication, HMR and async bundle URLs.
-- `references/graph.md` — `Graph`, module paths, refcounting and cycle collection, the commit protocol, modules with no file, `DeltaCalculator`, `Transformer`, workers, `Bundler` lifecycle, `IncrementalBundler` revisions, a bundle request end to end, HMR and Fast Refresh, server composition, configuration, `RootUrlMap`.
+- `references/graph.md` — `Graph`, module paths, refcounting and cycle collection, the commit protocol, modules with no file, `DeltaCalculator`, `Transformer` and shared transform results, workers, `Bundler` lifecycle, `IncrementalBundler` revisions, a bundle request end to end, lazy bundles, HMR and Fast Refresh, server composition, configuration, `RootUrlMap`.
 
 Also authoritative, in the repo itself: `docs/Concepts.md`, `docs/Bundling.md`, `docs/Caching.md`, `docs/Resolution.md`, `docs/PackageExports.md`, `docs/SourceMapFormat.md`, `docs/Configuration.md`.
 
@@ -309,5 +312,6 @@ Rules for keeping this honest, which must survive any future update:
 - **Describe only landed code.** If the working tree contains unlanded changes to a file this skill cites, document the public version.
 - **Give each fact one home.** State a mechanism in the reference that owns it and link to it from elsewhere; restating it is how one commit makes six passages wrong. Volatile status ("nothing on main does X") lives only in [Unused and gated mechanisms](#unused-and-gated-mechanisms).
 - **Weigh by importance, not recency.** A refresh fixes what's wrong and records each new mechanism once, in the reference that owns it. Don't promote a mechanism into this file's description, diagram, principles, checklist or anti-patterns unless it is on by default and load-bearing for typical changes; an unused or gated one gets a row in the table above and a section in its reference. State behavior as it stands, not the history of the fix that produced it, and keep PR numbers and benchmark figures out of this file — in references, keep a figure only where it is the justification a reader needs, ideally one the code itself records.
-- **To find what may have drifted**, list the commits since the pin that touch the code cited here. Sapling: `sl log -r "(4159bf41f092::remote/main - 4159bf41f092) and (file('glob:packages/metro*/src/**') or file('glob:docs/**'))"`. Git: `git log --oneline 4159bf41f092..origin/main -- ':(glob)packages/metro*/src/**' docs`.
+- **A fix earns text only if it changes a contract.** A run of fixes in one area (a watcher backend, symlink handling, a resolver option) is how a reference fills with edge cases that the code and its tests already pin. Record the rule a reader must respect, not each case that motivated it, and before finishing a refresh, compare each section's length with the importance of what it covers.
+- **To find what may have drifted**, list the commits since the pin that touch the code cited here. Sapling: `sl log -r "(ba761edb1335::remote/main - ba761edb1335) and (file('glob:packages/metro*/src/**') or file('glob:docs/**'))"`. Git: `git log --oneline ba761edb1335..origin/main -- ':(glob)packages/metro*/src/**' docs`.
 - **When you refresh the pin**, re-verify the quoted comments and constants — not just the paths — update both dates, and re-check every row of the table above.
